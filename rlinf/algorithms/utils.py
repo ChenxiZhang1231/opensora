@@ -367,3 +367,162 @@ def safe_normalize(array, loss_mask):
         array = (array - mean) / (std + 1e-5)
 
     return array
+
+
+# ========================== ReGRPO Utilities ==========================
+
+
+def aggregate_chunk_logprobs(
+    prev_logprobs: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Aggregate logprobs to chunk level by summing all dimensions.
+
+    For ReGRPO, we need to find the chunk with lowest logprob.
+    This function sums over all action dimensions to get a single
+    logprob value per chunk_step per trajectory.
+
+    Args:
+        prev_logprobs: Rollout logprobs.
+            Shape: [n_chunk_steps, bsz, num_action_chunks * action_dim]
+            or [n_chunk_steps, bsz, num_action_chunks, action_dim]
+
+    Returns:
+        chunk_logprobs: Summed logprobs per chunk_step.
+            Shape: [n_chunk_steps, bsz]
+    """
+    if prev_logprobs.dim() == 4:
+        # [n_chunk_steps, bsz, num_action_chunks, action_dim] -> [n_chunk_steps, bsz]
+        chunk_logprobs = prev_logprobs.sum(dim=[2, 3])
+    else:
+        # [n_chunk_steps, bsz, num_action_chunks * action_dim] -> [n_chunk_steps, bsz]
+        chunk_logprobs = prev_logprobs.sum(dim=-1)
+
+    return chunk_logprobs
+
+
+def find_min_logprob_chunk(
+    chunk_logprobs: torch.Tensor,
+    min_prefix_chunks: int = 1,
+) -> torch.Tensor:
+    """
+    Find the chunk position with lowest logprob for each trajectory.
+
+    This determines the "rewrite point" (t_clip) for ReGRPO.
+
+    Args:
+        chunk_logprobs: Logprobs per chunk_step. Shape: [n_chunks, bsz]
+        min_prefix_chunks: Minimum number of prefix chunks to ensure
+            at least some prefix contribution.
+
+    Returns:
+        t_clip: Rewrite position for each trajectory. Shape: [bsz]
+    """
+    # Find argmin along chunk dimension
+    t_clip = chunk_logprobs.argmin(dim=0)  # [bsz]
+
+    # Ensure at least min_prefix_chunks prefix chunks
+    t_clip = t_clip.clamp(min=min_prefix_chunks)
+
+    return t_clip
+
+
+def compute_flip_rate(
+    original_returns: torch.Tensor,
+    rewrite_returns: torch.Tensor,
+    success_threshold: float = 0.5,
+) -> torch.Tensor:
+    """
+    Compute flip rate from rewrite results.
+
+    Flip rate measures how often the outcome (success/failure) changes
+    between the original trajectory and rewritten trajectories.
+
+    Args:
+        original_returns: Original trajectory returns. Shape: [batch_size]
+        rewrite_returns: Rewritten trajectory returns. Shape: [batch_size, num_rewrite]
+        success_threshold: Threshold to determine success.
+
+    Returns:
+        p_flip: Flip rate for each trajectory. Shape: [batch_size]
+    """
+    batch_size = original_returns.shape[0]
+    num_rewrite = rewrite_returns.shape[1]
+    device = original_returns.device
+
+    # Determine success for original trajectories
+    orig_success = original_returns > success_threshold  # [batch_size]
+
+    # Determine success for rewritten trajectories
+    rewrite_success = rewrite_returns > success_threshold  # [batch_size, num_rewrite]
+
+    # Count flips (outcome changed)
+    flips = (rewrite_success != orig_success.unsqueeze(1)).float()  # [batch_size, num_rewrite]
+    flip_count = flips.sum(dim=1)  # [batch_size]
+
+    # Compute flip rate
+    p_flip = flip_count / num_rewrite  # [batch_size]
+
+    return p_flip
+
+
+def compute_estimated_flip_rate(
+    chunk_logprobs: torch.Tensor,
+    t_clip: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    Estimate flip rate based on logprob distribution without actual rewriting.
+
+    This is a faster approximation that uses the relative logprob differences
+    between prefix and suffix to estimate the flip probability.
+
+    The intuition: if the suffix has much lower logprobs than the prefix,
+    a rewrite is more likely to change the trajectory outcome.
+
+    Args:
+        chunk_logprobs: Logprobs per chunk_step. Shape: [n_chunks, bsz]
+        t_clip: Rewrite position for each trajectory. Shape: [bsz]
+        temperature: Temperature for softmax conversion.
+
+    Returns:
+        p_flip: Estimated flip rate. Shape: [bsz]
+    """
+    n_chunks, bsz = chunk_logprobs.shape
+    device = chunk_logprobs.device
+
+    # Create masks for prefix and suffix
+    chunk_indices = torch.arange(n_chunks, device=device).unsqueeze(1)  # [n_chunks, 1]
+    t_clip_expanded = t_clip.unsqueeze(0)  # [1, bsz]
+
+    prefix_mask = chunk_indices < t_clip_expanded  # [n_chunks, bsz]
+    suffix_mask = ~prefix_mask
+
+    # Compute mean logprob for prefix and suffix
+    prefix_logprobs = chunk_logprobs.clone()
+    prefix_logprobs[~prefix_mask] = float('-inf')
+    suffix_logprobs = chunk_logprobs.clone()
+    suffix_logprobs[~suffix_mask] = float('-inf')
+
+    # For prefix: mean over valid positions
+    prefix_count = prefix_mask.float().sum(dim=0).clamp(min=1)
+    suffix_count = suffix_mask.float().sum(dim=0).clamp(min=1)
+
+    # Replace -inf with 0 before summing
+    prefix_logprobs_safe = prefix_logprobs.clone()
+    prefix_logprobs_safe[~prefix_mask] = 0
+    suffix_logprobs_safe = suffix_logprobs.clone()
+    suffix_logprobs_safe[~suffix_mask] = 0
+
+    prefix_mean = prefix_logprobs_safe.sum(dim=0) / prefix_count  # [bsz]
+    suffix_mean = suffix_logprobs_safe.sum(dim=0) / suffix_count  # [bsz]
+
+    # Estimate flip rate based on logprob difference
+    # Lower suffix logprob relative to prefix suggests higher flip rate
+    logprob_diff = (prefix_mean - suffix_mean) / temperature
+    p_flip = torch.sigmoid(logprob_diff)  # [bsz]
+
+    # Clamp to reasonable range
+    p_flip = p_flip.clamp(min=0.01, max=0.99)
+
+    return p_flip

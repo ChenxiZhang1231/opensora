@@ -295,6 +295,9 @@ class Trajectory:
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)
 
+    # ReGRPO: saved environment states at each chunk step for rewriting
+    chunk_states: list[bytes] = field(default_factory=list)
+
     @staticmethod
     def _generate_field_mask(
         ref_tensor: torch.Tensor, mask: torch.Tensor, traj_len: int
@@ -424,6 +427,9 @@ class EmbodiedRolloutResult:
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
 
+    # ReGRPO: saved environment states at each chunk step for rewriting
+    chunk_states: list[bytes] = field(default_factory=list)
+
     def append_step_result(self, result: ChunkStepResult):
         if result.actions is not None:
             self.actions.append(result.actions)
@@ -532,6 +538,11 @@ class EmbodiedRolloutResult:
             trajectory.next_obs = stack_list_of_dict_tensor(self.next_obs)
             for key in trajectory.next_obs.keys():
                 trajectory.next_obs[key] = trajectory.next_obs[key].cpu().contiguous()
+
+        # ReGRPO: copy chunk_states
+        if len(self.chunk_states) > 0:
+            trajectory.chunk_states = self.chunk_states.copy()
+
         return trajectory
 
     def to_splited_trajectories(self, split_size: int) -> list[Trajectory]:
@@ -577,6 +588,11 @@ class EmbodiedRolloutResult:
                 chunks = torch.chunk(value, split_size, dim=1)
                 for i in range(split_size):
                     setattr(splited_trajectories[i], field_name, chunks[i])
+            elif isinstance(value, list):
+                # Handle list fields (e.g., chunk_states) - just copy as-is
+                # These are typically not split across trajectories
+                for i in range(split_size):
+                    setattr(splited_trajectories[i], field_name, value)
             else:
                 raise ValueError(
                     f"Unsupported value type: {type(value)} for field_name: {field_name}"

@@ -220,6 +220,98 @@ def compute_grpo_dynamic_advantages(
     return advantages, None
 
 
+@register_advantage("regrpo")
+def compute_regrpo_advantages(
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor,
+    group_size: int,
+    t_clip: torch.Tensor,
+    p_flip: torch.Tensor,
+    num_chunk: int,
+    chunk_size: int,
+    **kwargs,
+):
+    """
+    Compute ReGRPO advantages with flip rate from rewriting.
+
+    ReGRPO redistributes advantages based on prefix-suffix contribution analysis.
+    The weight is determined by the flip rate (p_flip) computed from rewriting
+    trajectories from the lowest logprob position (t_clip).
+
+    Weight formula:
+    - prefix (t < t_clip): w_t = (1 - p_flip) / t_clip
+    - suffix (t >= t_clip): w_t = p_flip / (T - t_clip)
+
+    Args:
+        rewards: Reward scores after calculate_scores. Shape: [num_groups, group_size]
+        loss_mask: Loss mask. Shape: [n_steps, batch_size]
+        group_size: Group size for GRPO advantage computation.
+        t_clip: Rewrite position for each trajectory. Shape: [batch_size]
+        p_flip: Flip rate for each trajectory. Shape: [batch_size]
+        num_chunk: Number of chunks (T).
+        chunk_size: Size of each chunk (for expanding to step level).
+
+    Returns:
+        advantages: Shape [n_steps, batch_size]
+        returns: None
+    """
+    T = num_chunk
+    batch_size = t_clip.shape[0]
+    device = rewards.device
+
+    # Ensure t_clip and p_flip are on the same device as rewards
+    t_clip = t_clip.to(device)
+    p_flip = p_flip.to(device)
+
+    # 1. Compute original GRPO advantage (per trajectory)
+    grouped_rewards = rewards.view(-1, group_size)
+    grouped_reward_mean = grouped_rewards.mean(dim=-1, keepdim=True)
+    grouped_reward_std = grouped_rewards.std(dim=-1, keepdim=True)
+    A_traj = (grouped_rewards - grouped_reward_mean) / (grouped_reward_std + 1e-6)
+    A_traj_flat = A_traj.view(-1)  # [batch_size]
+
+    # 2. Compute weight distribution based on t_clip and p_flip
+    # chunk_indices: [T, 1]
+    chunk_indices = torch.arange(T, device=device).unsqueeze(1).float()
+    # t_clip_expanded: [1, batch_size]
+    t_clip_expanded = t_clip.unsqueeze(0).float()
+
+    # Create masks for prefix and suffix
+    prefix_mask = chunk_indices < t_clip_expanded  # [T, batch_size]
+    suffix_mask = ~prefix_mask
+
+    # p_flip_expanded: [1, batch_size]
+    p_flip_expanded = p_flip.unsqueeze(0).float()
+
+    # Avoid division by zero
+    t_clip_safe = t_clip_expanded.clamp(min=1)
+    suffix_len_safe = (T - t_clip_expanded).clamp(min=1)
+
+    # Compute weights per chunk
+    prefix_weight = (1 - p_flip_expanded) / t_clip_safe
+    suffix_weight = p_flip_expanded / suffix_len_safe
+
+    # Combine weights: [T, batch_size]
+    chunk_weights = prefix_mask.float() * prefix_weight + suffix_mask.float() * suffix_weight
+
+    # Normalize weights so they sum to 1 for each trajectory
+    weight_sum = chunk_weights.sum(dim=0, keepdim=True)
+    chunk_weights = chunk_weights / (weight_sum + 1e-8)
+
+    # 3. Apply weights to advantage
+    # A_traj_flat: [batch_size] -> [1, batch_size]
+    chunk_advantages = A_traj_flat.unsqueeze(0) * chunk_weights * T  # [T, batch_size]
+
+    # 4. Expand from chunk level to action/step level
+    # Repeat each chunk value for chunk_size steps
+    advantages = chunk_advantages.repeat_interleave(chunk_size, dim=0)  # [n_steps, batch_size]
+
+    # Apply loss mask
+    advantages = advantages * loss_mask
+
+    return advantages, None
+
+
 @register_advantage("reinpp")
 def compute_reinpp_advantages(
     rewards: torch.Tensor,

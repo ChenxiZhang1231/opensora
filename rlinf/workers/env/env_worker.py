@@ -60,6 +60,25 @@ class EnvWorker(Worker):
                 self.cfg.env.eval.total_num_envs // self._world_size // self.stage_num
             )
 
+        # ReGRPO: enable chunk state saving for rewriting
+        self.enable_regrpo = cfg.algorithm.get("adv_type", "") == "regrpo"
+        self.regrpo_num_rewrite = cfg.algorithm.get("regrpo", {}).get("num_rewrite", 2)
+        self.regrpo_success_threshold = cfg.algorithm.get("regrpo", {}).get(
+            "success_threshold", 0.5
+        )
+        # Storage for chunk states, actions, and returns (per stage, per epoch)
+        # chunk_states_buffer[stage_id][epoch][chunk_idx] = bytes
+        self.chunk_states_buffer: list[list[list[bytes]]] = []
+        # chunk_actions_buffer[stage_id][epoch][chunk_idx] = tensor
+        self.chunk_actions_buffer: list[list[list[torch.Tensor]]] = []
+        # chunk_rewards_buffer[stage_id][epoch][chunk_idx] = tensor [num_envs]
+        self.chunk_rewards_buffer: list[list[list[torch.Tensor]]] = []
+        # epoch_returns_buffer[stage_id][epoch] = tensor of returns per env
+        self.epoch_returns_buffer: list[list[torch.Tensor]] = []
+        # Final p_flip and t_clip for all trajectories
+        self.regrpo_p_flip: torch.Tensor = None
+        self.regrpo_t_clip: torch.Tensor = None
+
     def init_worker(self):
         self.dst_ranks = {
             "train": self._setup_dst_ranks(
@@ -422,8 +441,38 @@ class EnvWorker(Worker):
         )
 
         env_metrics = defaultdict(list)
+
+        # ReGRPO: initialize buffers for chunk states and returns
+        if self.enable_regrpo:
+            self.chunk_states_buffer = [
+                [] for _ in range(self.stage_num)
+            ]  # [stage][epoch][chunk]
+            self.chunk_actions_buffer = [
+                [] for _ in range(self.stage_num)
+            ]  # [stage][epoch][chunk]
+            self.chunk_rewards_buffer = [
+                [] for _ in range(self.stage_num)
+            ]  # [stage][epoch][chunk]
+            self.epoch_returns_buffer = [
+                [] for _ in range(self.stage_num)
+            ]  # [stage][epoch]
+            # Track cumulative rewards per epoch per env
+            epoch_cumulative_rewards = [
+                torch.zeros(self.train_num_envs_per_stage)
+                for _ in range(self.stage_num)
+            ]
+
         for epoch in range(self.cfg.algorithm.rollout_epoch):
             env_output_list = []
+
+            # ReGRPO: initialize chunk states and actions for this epoch
+            if self.enable_regrpo:
+                for stage_id in range(self.stage_num):
+                    self.chunk_states_buffer[stage_id].append([])
+                    self.chunk_actions_buffer[stage_id].append([])
+                    self.chunk_rewards_buffer[stage_id].append([])
+                    epoch_cumulative_rewards[stage_id].zero_()
+
             if not self.cfg.env.train.auto_reset:
                 for stage_id in range(self.stage_num):
                     self.env_list[stage_id].is_start = True
@@ -475,14 +524,51 @@ class EnvWorker(Worker):
                 env_output: EnvOutput = env_output_list[stage_id]
                 self.send_env_batch(output_channel, env_output.to_dict())
 
-            for _ in range(n_chunk_steps):
+            for chunk_idx in range(n_chunk_steps):
                 for stage_id in range(self.stage_num):
+                    # ReGRPO: save chunk state BEFORE executing action
+                    if self.enable_regrpo and hasattr(
+                        self.env_list[stage_id], "get_state"
+                    ):
+                        chunk_state = self.env_list[stage_id].get_state()
+                        self.chunk_states_buffer[stage_id][epoch].append(chunk_state)
+
                     raw_chunk_actions = self.recv_chunk_actions(input_channel)
+
+                    # ReGRPO: save actions for rewriting
+                    if self.enable_regrpo:
+                        if isinstance(raw_chunk_actions, torch.Tensor):
+                            self.chunk_actions_buffer[stage_id][epoch].append(
+                                raw_chunk_actions.clone().cpu()
+                            )
+                        else:
+                            # numpy array
+                            self.chunk_actions_buffer[stage_id][epoch].append(
+                                torch.from_numpy(raw_chunk_actions.copy())
+                            )
+
                     env_output, env_info = self.env_interact_step(
                         raw_chunk_actions, stage_id
                     )
                     self.send_env_batch(output_channel, env_output.to_dict())
                     env_output_list[stage_id] = env_output
+
+                    # ReGRPO: save per-chunk rewards and accumulate
+                    if self.enable_regrpo and env_output.rewards is not None:
+                        # rewards shape: [num_envs, num_action_chunks]
+                        rewards = env_output.rewards
+                        if isinstance(rewards, torch.Tensor):
+                            chunk_reward_sum = rewards.sum(dim=-1).cpu()
+                        else:
+                            # numpy array
+                            chunk_reward_sum = torch.from_numpy(
+                                rewards.sum(axis=-1).copy()
+                            )
+                        self.chunk_rewards_buffer[stage_id][epoch].append(
+                            chunk_reward_sum.clone()
+                        )
+                        epoch_cumulative_rewards[stage_id] += chunk_reward_sum
+
                     for key, value in env_info.items():
                         if (
                             not self.cfg.env.train.auto_reset
@@ -495,12 +581,23 @@ class EnvWorker(Worker):
                         else:
                             env_metrics[key].append(value)
 
+            # ReGRPO: store epoch returns
+            if self.enable_regrpo:
+                for stage_id in range(self.stage_num):
+                    self.epoch_returns_buffer[stage_id].append(
+                        epoch_cumulative_rewards[stage_id].clone()
+                    )
+
             self.last_obs_list = [env_output.obs for env_output in env_output_list]
             self.last_intervened_info_list = [
                 (env_output.intervene_actions, env_output.intervene_flags)
                 for env_output in env_output_list
             ]
             self.finish_rollout()
+
+        # ReGRPO: compute t_clip, perform rewriting, and calculate p_flip
+        if self.enable_regrpo:
+            self._perform_regrpo_rewriting()
 
         for env in self.env_list:
             if self.cfg.env.train.get("enable_offload", False) and hasattr(
@@ -511,7 +608,219 @@ class EnvWorker(Worker):
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
 
+        # ReGRPO: include t_clip and p_flip in metrics for ActorWorker
+        if self.enable_regrpo and self.regrpo_p_flip is not None:
+            env_metrics["regrpo_t_clip"] = self.regrpo_t_clip.cpu()
+            env_metrics["regrpo_p_flip"] = self.regrpo_p_flip.cpu()
+
         return env_metrics
+
+    def rewrite_trajectories(
+        self,
+        t_clip_per_traj: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        ReGRPO: Rewrite trajectories from t_clip position to compute real flip rate.
+
+        Uses saved chunk states and original actions for rewriting.
+        For stochastic environments (like OpenSora), even with the same actions,
+        the trajectory outcomes can differ due to environment randomness.
+
+        Args:
+            t_clip_per_traj: Rewrite position for each trajectory.
+                Shape: [total_num_envs * rollout_epoch] flattened across all stages/epochs.
+
+        Returns:
+            rewrite_returns: Returns from rewritten trajectories.
+                Shape: [total_num_envs * rollout_epoch, num_rewrite]
+        """
+        if not self.enable_regrpo:
+            raise RuntimeError("rewrite_trajectories called but ReGRPO is not enabled")
+
+        n_chunk_steps = (
+            self.cfg.env.train.max_steps_per_rollout_epoch
+            // self.cfg.actor.model.num_action_chunks
+        )
+        num_rewrite = self.regrpo_num_rewrite
+        rollout_epoch = self.cfg.algorithm.rollout_epoch
+
+        # Reshape t_clip to [stage_num, rollout_epoch, num_envs_per_stage]
+        total_trajs = t_clip_per_traj.shape[0]
+        envs_per_stage = self.train_num_envs_per_stage
+        expected_total = self.stage_num * rollout_epoch * envs_per_stage
+        assert total_trajs == expected_total, (
+            f"t_clip shape mismatch: got {total_trajs}, expected {expected_total}"
+        )
+
+        t_clip_reshaped = t_clip_per_traj.view(
+            self.stage_num, rollout_epoch, envs_per_stage
+        )
+
+        # Storage for rewrite returns: [stage, epoch, env, rewrite_idx]
+        all_rewrite_returns = torch.zeros(
+            self.stage_num, rollout_epoch, envs_per_stage, num_rewrite
+        )
+
+        # Onload envs if needed
+        for env in self.env_list:
+            if hasattr(env, "onload"):
+                env.onload()
+
+        # For each rewrite iteration
+        for rewrite_idx in range(num_rewrite):
+            # For each epoch
+            for epoch in range(rollout_epoch):
+                # For each stage
+                for stage_id in range(self.stage_num):
+                    env = self.env_list[stage_id]
+                    chunk_states = self.chunk_states_buffer[stage_id][epoch]
+                    chunk_actions = self.chunk_actions_buffer[stage_id][epoch]
+
+                    # Get t_clip for each env in this stage/epoch
+                    t_clips = t_clip_reshaped[stage_id, epoch]  # [num_envs]
+
+                    # We need to handle different t_clip values per env
+                    # For simplicity, use the minimum t_clip and rollout from there
+                    min_t_clip = int(t_clips.min().item())
+                    min_t_clip = max(1, min(min_t_clip, n_chunk_steps - 1))
+
+                    # Restore state at min_t_clip position
+                    if min_t_clip < len(chunk_states):
+                        env.load_state(chunk_states[min_t_clip])
+
+                    # Track rewards for this rewrite
+                    rewrite_cumulative_rewards = torch.zeros(envs_per_stage)
+
+                    # Rollout from min_t_clip to end using saved actions
+                    for chunk_idx in range(min_t_clip, n_chunk_steps):
+                        # Get saved action for this chunk
+                        action = chunk_actions[chunk_idx]
+                        if isinstance(action, torch.Tensor):
+                            action = action.to(env.device)
+                        else:
+                            action = torch.from_numpy(action).to(env.device)
+
+                        # Execute action (environment stochasticity causes different results)
+                        if hasattr(env, "chunk_step"):
+                            obs_list, rewards, terminations, truncations, infos = (
+                                env.chunk_step(action)
+                            )
+                            # rewards shape: [num_envs, chunk]
+                            if isinstance(rewards, torch.Tensor):
+                                chunk_reward_sum = rewards.sum(dim=-1).cpu()
+                            else:
+                                chunk_reward_sum = torch.from_numpy(
+                                    rewards.sum(axis=-1).copy()
+                                )
+                        else:
+                            # Fallback for non-chunk environments
+                            obs, rewards, terminations, truncations, infos = env.step(
+                                action
+                            )
+                            if isinstance(rewards, torch.Tensor):
+                                chunk_reward_sum = rewards.cpu()
+                            else:
+                                chunk_reward_sum = torch.from_numpy(
+                                    np.atleast_1d(rewards).copy()
+                                )
+
+                        rewrite_cumulative_rewards += chunk_reward_sum
+
+                    # Store rewrite returns
+                    all_rewrite_returns[stage_id, epoch, :, rewrite_idx] = (
+                        rewrite_cumulative_rewards
+                    )
+
+        # Offload envs if needed
+        for env in self.env_list:
+            if self.cfg.env.train.get("enable_offload", False) and hasattr(
+                env, "offload"
+            ):
+                env.offload()
+
+        # Flatten returns to [total_trajs, num_rewrite]
+        rewrite_returns = all_rewrite_returns.view(-1, num_rewrite)
+        return rewrite_returns
+
+    def get_original_returns(self) -> torch.Tensor:
+        """
+        ReGRPO: Get original trajectory returns from buffer.
+
+        Returns:
+            original_returns: Shape [total_num_envs * rollout_epoch]
+        """
+        if not self.enable_regrpo:
+            raise RuntimeError("get_original_returns called but ReGRPO is not enabled")
+
+        # epoch_returns_buffer[stage_id][epoch] = tensor [num_envs_per_stage]
+        all_returns = []
+        for stage_id in range(self.stage_num):
+            for epoch in range(len(self.epoch_returns_buffer[stage_id])):
+                all_returns.append(self.epoch_returns_buffer[stage_id][epoch])
+
+        return torch.cat(all_returns, dim=0)
+
+    def _perform_regrpo_rewriting(self):
+        """
+        ReGRPO: Compute t_clip based on rewards, perform rewriting, and compute p_flip.
+
+        This method:
+        1. Computes t_clip using reward drops (finding decision points)
+        2. Performs trajectory rewriting from t_clip positions
+        3. Computes flip rate by comparing original and rewritten returns
+        4. Stores t_clip and p_flip for later use by ActorWorker
+        """
+        rollout_epoch = self.cfg.algorithm.rollout_epoch
+        n_chunk_steps = (
+            self.cfg.env.train.max_steps_per_rollout_epoch
+            // self.cfg.actor.model.num_action_chunks
+        )
+        envs_per_stage = self.train_num_envs_per_stage
+
+        # 1. Compute t_clip based on reward pattern
+        # Use reward drop as heuristic for finding critical decision points
+        all_t_clips = []
+        for stage_id in range(self.stage_num):
+            for epoch in range(rollout_epoch):
+                chunk_rewards = self.chunk_rewards_buffer[stage_id][epoch]
+                if len(chunk_rewards) < 2:
+                    # Not enough chunks, use middle point
+                    t_clip = torch.full(
+                        (envs_per_stage,), n_chunk_steps // 2, dtype=torch.long
+                    )
+                else:
+                    # Stack rewards: [n_chunks, num_envs]
+                    rewards_stacked = torch.stack(chunk_rewards, dim=0)
+                    # Find the chunk with lowest reward (indicating failure point)
+                    t_clip = rewards_stacked.argmin(dim=0)
+                    # Ensure at least 1 prefix chunk
+                    t_clip = t_clip.clamp(min=1, max=n_chunk_steps - 1)
+                all_t_clips.append(t_clip)
+
+        # Flatten t_clip: [total_trajs]
+        self.regrpo_t_clip = torch.cat(all_t_clips, dim=0)
+
+        # 2. Perform rewriting
+        rewrite_returns = self.rewrite_trajectories(self.regrpo_t_clip)
+        # rewrite_returns shape: [total_trajs, num_rewrite]
+
+        # 3. Get original returns
+        original_returns = self.get_original_returns()
+        # original_returns shape: [total_trajs]
+
+        # 4. Compute flip rate
+        success_threshold = self.regrpo_success_threshold
+        orig_success = original_returns > success_threshold  # [total_trajs]
+        rewrite_success = rewrite_returns > success_threshold  # [total_trajs, num_rewrite]
+
+        # Count flips
+        flips = (rewrite_success != orig_success.unsqueeze(1)).float()
+        flip_count = flips.sum(dim=1)  # [total_trajs]
+        num_rewrite = rewrite_returns.shape[1]
+
+        self.regrpo_p_flip = flip_count / num_rewrite
+        # Clamp to avoid extreme values
+        self.regrpo_p_flip = self.regrpo_p_flip.clamp(min=0.01, max=0.99)
 
     def evaluate(self, input_channel: Channel, output_channel: Channel):
         eval_metrics = defaultdict(list)

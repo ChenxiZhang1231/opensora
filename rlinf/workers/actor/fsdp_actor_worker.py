@@ -1161,9 +1161,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return rollout_batch
 
-    def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
+    def compute_advantages_and_returns(
+        self, regrpo_data: dict = None
+    ) -> dict[str, torch.Tensor]:
         """
         Compute the advantages and returns.
+
+        Args:
+            regrpo_data: Optional dict with 't_clip' and 'p_flip' tensors for ReGRPO.
         """
         kwargs = {
             "task_type": self.cfg.runner.task_type,
@@ -1178,6 +1183,35 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
         }
+
+        # ReGRPO: use real t_clip and p_flip from EnvWorker rewriting
+        if self.cfg.algorithm.adv_type == "regrpo":
+            if regrpo_data is not None and "t_clip" in regrpo_data and "p_flip" in regrpo_data:
+                # Use real rewriting results from EnvWorker
+                t_clip = regrpo_data["t_clip"].to(self.device)
+                p_flip = regrpo_data["p_flip"].to(self.device)
+            else:
+                # Fallback to estimated flip rate
+                from rlinf.algorithms.utils import (
+                    aggregate_chunk_logprobs,
+                    compute_estimated_flip_rate,
+                    find_min_logprob_chunk,
+                )
+
+                prev_logprobs = self.rollout_batch["prev_logprobs"]
+                chunk_logprobs = aggregate_chunk_logprobs(prev_logprobs)
+                regrpo_cfg = self.cfg.algorithm.get("regrpo", {})
+                min_prefix_chunks = regrpo_cfg.get("min_prefix_chunks", 1)
+                t_clip = find_min_logprob_chunk(chunk_logprobs, min_prefix_chunks)
+                flip_rate_temperature = regrpo_cfg.get("flip_rate_temperature", 1.0)
+                p_flip = compute_estimated_flip_rate(
+                    chunk_logprobs, t_clip, temperature=flip_rate_temperature
+                )
+
+            kwargs.update({
+                "t_clip": t_clip,
+                "p_flip": p_flip,
+            })
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
 

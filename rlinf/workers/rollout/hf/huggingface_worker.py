@@ -78,6 +78,9 @@ class MultiStepRolloutWorker(Worker):
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
         self.enable_eval = cfg.runner.val_check_interval > 0 or cfg.runner.only_eval
 
+        # ReGRPO: flag to enable chunk state saving for rewriting
+        self.enable_regrpo = cfg.algorithm.get("adv_type", "") == "regrpo"
+
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
         with open_dict(rollout_model_config):

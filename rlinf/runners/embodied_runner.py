@@ -181,10 +181,27 @@ class EmbodiedRunner:
                     ).wait()
                     rollout_handle.wait()
 
+                # ReGRPO: wait for env to finish rewriting and get p_flip
+                regrpo_data = None
+                if self.cfg.algorithm.get("adv_type", "") == "regrpo":
+                    env_results_list = [
+                        results for results in env_handle.wait() if results is not None
+                    ]
+                    # Extract regrpo data from env_metrics
+                    for env_result in env_results_list:
+                        if "regrpo_t_clip" in env_result and "regrpo_p_flip" in env_result:
+                            regrpo_data = {
+                                "t_clip": env_result["regrpo_t_clip"],
+                                "p_flip": env_result["regrpo_p_flip"],
+                            }
+                            break
+
                 # compute advantages and returns.
                 with self.timer("cal_adv_and_returns"):
                     actor_rollout_metrics = (
-                        self.actor.compute_advantages_and_returns().wait()
+                        self.actor.compute_advantages_and_returns(
+                            regrpo_data=regrpo_data
+                        ).wait()
                     )
 
                 # actor training.
@@ -232,9 +249,11 @@ class EmbodiedRunner:
                 }
             )
 
-            env_results_list = [
-                results for results in env_handle.wait() if results is not None
-            ]
+            # Get env_results (already fetched for regrpo)
+            if self.cfg.algorithm.get("adv_type", "") != "regrpo":
+                env_results_list = [
+                    results for results in env_handle.wait() if results is not None
+                ]
             env_metrics = compute_evaluate_metrics(env_results_list)
             env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
 

@@ -142,6 +142,10 @@ class WanEnv(BaseWorldEnv):
         self.returns = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.float32
         )
+        # For use_success_reward mode: track if env has already succeeded
+        self.has_succeeded = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -151,12 +155,14 @@ class WanEnv(BaseWorldEnv):
             if self.record_metrics:
                 self.success_once[mask] = False
                 self.returns[mask] = 0
+                self.has_succeeded[mask] = False
             # self._elapsed_steps = 0
         else:
             self.prev_step_reward[:] = 0
             if self.record_metrics:
                 self.success_once[:] = False
                 self.returns[:] = 0.0
+                self.has_succeeded[:] = False
             self._elapsed_steps = 0
 
     def _record_metrics(self, step_reward, terminations, infos):
@@ -183,7 +189,21 @@ class WanEnv(BaseWorldEnv):
         return infos
 
     def _calc_step_reward(self, chunk_rewards):
-        """Calculate step reward"""
+        """Calculate step reward based on reward mode."""
+        # Success reward mode: give fixed reward on first success only
+        if getattr(self.cfg, "use_success_reward", False):
+            success_threshold = getattr(self.cfg, "success_reward_threshold", 0.9)
+            success_coef = getattr(self.cfg, "success_reward_coef", 1.0)
+
+            current_success = chunk_rewards.max(dim=1)[0] >= success_threshold
+            first_success = current_success & (~self.has_succeeded)
+            self.has_succeeded = self.has_succeeded | current_success
+
+            rewards = torch.zeros_like(chunk_rewards)
+            rewards[first_success, -1] = success_coef * self.cfg.reward_coef
+            return rewards
+
+        # Default mode: reward diff calculation
         reward_diffs = torch.zeros(
             (self.num_envs, self.chunk), dtype=torch.float32, device=self.device
         )
@@ -727,6 +747,7 @@ class WanEnv(BaseWorldEnv):
         if self.record_metrics:
             self.success_once = self.success_once.cpu()
             self.returns = self.returns.cpu()
+            self.has_succeeded = self.has_succeeded.cpu()
         torch.cuda.empty_cache()
         self._is_offloaded = True
 
@@ -743,6 +764,7 @@ class WanEnv(BaseWorldEnv):
         if self.record_metrics:
             self.success_once = self.success_once.to(self.device)
             self.returns = self.returns.to(self.device)
+            self.has_succeeded = self.has_succeeded.to(self.device)
         self._is_offloaded = False
 
     def get_state(self) -> bytes:
@@ -764,6 +786,7 @@ class WanEnv(BaseWorldEnv):
                 {
                     "success_once": self.success_once.cpu(),
                     "returns": self.returns.cpu(),
+                    "has_succeeded": self.has_succeeded.cpu(),
                 }
             )
 

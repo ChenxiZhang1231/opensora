@@ -1211,7 +1211,92 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             kwargs.update({
                 "t_clip": t_clip,
                 "p_flip": p_flip,
+                "num_rewrite": self.cfg.algorithm.get("regrpo", {}).get("num_rewrite", 8),
+                "regrpo_max_amp": self.cfg.algorithm.get("regrpo", {}).get("max_amp", 3.0),
+                "regrpo_alpha": self.cfg.algorithm.get("regrpo", {}).get("alpha", 1.0),
             })
+
+        # SeGRPO: use t_clip and mean rewrite rewards from EnvWorker rewriting
+        if self.cfg.algorithm.adv_type == "segrpo":
+            if regrpo_data is not None and "t_clip" in regrpo_data and "rewrite_rewards" in regrpo_data:
+                t_clip = regrpo_data["t_clip"].to(self.device)
+                rewrite_rewards = regrpo_data["rewrite_rewards"].to(self.device)
+            else:
+                raise RuntimeError(
+                    "SeGRPO requires t_clip and rewrite_rewards from EnvWorker. "
+                    "Make sure enable_regrpo is active and rewriting completed."
+                )
+            kwargs.update({
+                "t_clip": t_clip,
+                "rewrite_rewards": rewrite_rewards,
+            })
+
+        # FullGRPO: compute two separate advantage sets for two-pass training
+        if self.cfg.algorithm.adv_type == "fullgrpo":
+            if (regrpo_data is not None and "t_clip" in regrpo_data
+                    and "p_flip" in regrpo_data and "rewrite_rewards" in regrpo_data):
+                t_clip = regrpo_data["t_clip"].to(self.device)
+                p_flip = regrpo_data["p_flip"].to(self.device)
+                rewrite_rewards = regrpo_data["rewrite_rewards"].to(self.device)
+            else:
+                raise RuntimeError(
+                    "FullGRPO requires t_clip, p_flip and rewrite_rewards from EnvWorker. "
+                    "Make sure enable_regrpo is active and rewriting completed."
+                )
+            _regrpo_max_amp = self.cfg.algorithm.get("regrpo", {}).get("max_amp", 3.0)
+            _regrpo_alpha = self.cfg.algorithm.get("regrpo", {}).get("alpha", 1.0)
+            # Pass 1: ReGRPO advantages (all chunks), with alpha/max_amp modulation
+            regrpo_adv = calculate_adv_and_returns(**{**kwargs, "adv_type": "regrpo",
+                                                      "t_clip": t_clip, "p_flip": p_flip,
+                                                      "regrpo_max_amp": _regrpo_max_amp,
+                                                      "regrpo_alpha": _regrpo_alpha})
+            # Pass 2: SeGRPO advantages (suffix only), scaled by alpha
+            segrpo_adv = calculate_adv_and_returns(**{**kwargs, "adv_type": "segrpo",
+                                                      "t_clip": t_clip,
+                                                      "rewrite_rewards": rewrite_rewards,
+                                                      "regrpo_alpha": _regrpo_alpha})
+            advantages_and_returns = regrpo_adv  # primary advantages for rollout_batch
+            self.rollout_batch.update(advantages_and_returns)
+            self.rollout_batch["segrpo_advantages"] = segrpo_adv["advantages"]
+
+            # [BP1] 断点1: 两部分 A 刚计算完，检查值域和分布
+            _rank = int(os.environ.get("RANK", 0))
+            _A_re = regrpo_adv["advantages"]   # [n_steps, batch]
+            _A_se = segrpo_adv["advantages"]   # [n_steps, batch]
+            # reshape to [T, batch]: chunk_size = n_steps // T (T=32)
+            _T = 32
+            _cs = _A_re.shape[0] // _T
+            _A_re_chunk = _A_re.reshape(_T, _cs, -1).mean(dim=1)  # [T, batch], mean over chunk_size
+            print(
+                f"[BP1][rank{_rank}] regrpo A: "
+                f"shape={list(_A_re.shape)}, mean={_A_re.mean():.4f}, std={_A_re.std():.4f} | "
+                f"row0={_A_re_chunk[0, :4].tolist()} | rowN={_A_re_chunk[-1, :4].tolist()} | "
+                f"row0==rowN: {(_A_re_chunk[0] - _A_re_chunk[-1]).abs().max().item() < 1e-4}"
+            )
+            print(
+                f"[BP1][rank{_rank}] segrpo A: "
+                f"shape={list(_A_se.shape)}, nonzero={(_A_se.abs() > 1e-6).sum().item()}, "
+                f"max={_A_se.max():.4f}, min={_A_se.min():.4f}"
+            )
+
+            # [BP2] 断点2: rollout_batch 两部分都存好，训练前最终检查
+            print(
+                f"[BP2][rank{_rank}] rollout_batch advantages(regrpo): "
+                f"shape={list(self.rollout_batch['advantages'].shape)}, "
+                f"std={self.rollout_batch['advantages'].std():.4f}"
+            )
+            print(
+                f"[BP2][rank{_rank}] rollout_batch segrpo_advantages: "
+                f"shape={list(self.rollout_batch['segrpo_advantages'].shape)}, "
+                f"nonzero={( self.rollout_batch['segrpo_advantages'].abs() > 1e-6).sum().item()}"
+            )
+
+            if kwargs["loss_mask"] is not None:
+                self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
+            if kwargs["loss_mask_sum"] is not None:
+                self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
+            rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+            return rollout_metrics
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
 
@@ -1394,20 +1479,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                     forward_inputs = batch.get("forward_inputs", None)
 
-                    kwargs = {}
+                    model_kwargs = {}
                     if SupportedModel(self.cfg.actor.model.model_type) in [
                         SupportedModel.OPENVLA,
                         SupportedModel.OPENVLA_OFT,
                     ]:
-                        kwargs["temperature"] = (
+                        model_kwargs["temperature"] = (
                             self.cfg.algorithm.sampling_params.temperature_train
                         )
-                        kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
+                        model_kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
                     elif (
                         SupportedModel(self.cfg.actor.model.model_type)
                         == SupportedModel.GR00T
                     ):
-                        kwargs["prev_logprobs"] = prev_logprobs
+                        model_kwargs["prev_logprobs"] = prev_logprobs
 
                     compute_values = (
                         True if self.cfg.algorithm.adv_type == "gae" else False
@@ -1420,7 +1505,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
                             compute_values=compute_values,
                             use_cache=False,
-                            **kwargs,
+                            **model_kwargs,
                         )
 
                     if (
@@ -1469,6 +1554,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
                     metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
 
+                    metrics_data["actor/kl_loss"] = 0.0
+
                     if self.enable_sft_co_train:
                         self._train_sft_epoch(metrics_data, loss)
 
@@ -1497,6 +1584,114 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
+
+        # FullGRPO: second pass with SeGRPO advantages (suffix only, rewrite rewards)
+        if self.cfg.algorithm.adv_type == "fullgrpo" and "segrpo_advantages" in self.rollout_batch:
+            # [BP3] 断点3: 第二 pass 开始前，advantages 被替换为 segrpo_advantages
+            _rank = int(os.environ.get("RANK", 0))
+            _A_before = self.rollout_batch["advantages"]
+            _A_seg = self.rollout_batch["segrpo_advantages"]
+            print(
+                f"[BP3][rank{_rank}] Before swap — advantages(regrpo): "
+                f"mean={_A_before.mean():.4f}, std={_A_before.std():.4f}"
+            )
+            print(
+                f"[BP3][rank{_rank}] Before swap — segrpo_advantages: "
+                f"nonzero={(_A_seg.abs() > 1e-6).sum().item()}, "
+                f"max={_A_seg.max():.4f}, min={_A_seg.min():.4f}"
+            )
+            self.rollout_batch["advantages"] = self.rollout_batch.pop("segrpo_advantages")
+            print(
+                f"[BP3][rank{_rank}] After swap — advantages(segrpo): "
+                f"nonzero={( self.rollout_batch['advantages'].abs() > 1e-6).sum().item()}, "
+                f"max={self.rollout_batch['advantages'].max():.4f}, "
+                f"min={self.rollout_batch['advantages'].min():.4f}"
+            )
+            metrics2 = {}
+            for _ in range(update_epoch):
+                rollout_dataloader_iter = split_dict_to_chunk(
+                    self.rollout_batch,
+                    rollout_size // batch_size_per_rank,
+                )
+                for train_global_batch in rollout_dataloader_iter:
+                    train_global_batch_size = train_global_batch["prev_logprobs"].shape[0]
+                    train_micro_batch = split_dict_to_chunk(
+                        train_global_batch,
+                        train_global_batch_size // self.cfg.actor.micro_batch_size,
+                    )
+                    self.optimizer.zero_grad()
+                    for idx, batch in enumerate(train_micro_batch):
+                        batch = put_tensor_device(
+                            batch, f"cuda:{int(os.environ['LOCAL_RANK'])}"
+                        )
+                        backward_ctx = self.before_micro_batch(
+                            self.model,
+                            is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
+                        )
+                        advantages = batch["advantages"]
+                        prev_logprobs = batch["prev_logprobs"]
+                        returns = batch.get("returns", None)
+                        prev_values = batch.get("prev_values", None)
+                        loss_mask = batch.get("loss_mask", None)
+                        loss_mask_sum = batch.get("loss_mask_sum", None)
+                        forward_inputs = batch.get("forward_inputs", None)
+
+                        fwd_kwargs = {}
+                        if SupportedModel(self.cfg.actor.model.model_type) in [
+                            SupportedModel.OPENVLA, SupportedModel.OPENVLA_OFT,
+                        ]:
+                            fwd_kwargs["temperature"] = (
+                                self.cfg.algorithm.sampling_params.temperature_train
+                            )
+                            fwd_kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
+
+                        with self.amp_context:
+                            output_dict = self.model(
+                                forward_inputs=forward_inputs,
+                                compute_logprobs=True,
+                                compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
+                                compute_values=False,
+                                use_cache=False,
+                                **fwd_kwargs,
+                            )
+
+                        loss_kwargs = {
+                            "loss_type": self.cfg.algorithm.loss_type,
+                            "logprob_type": self.cfg.algorithm.logprob_type,
+                            "reward_type": self.cfg.algorithm.reward_type,
+                            "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
+                            "logprobs": output_dict["logprobs"],
+                            "values": None,
+                            "old_logprobs": prev_logprobs,
+                            "advantages": advantages,
+                            "returns": returns,
+                            "prev_values": prev_values,
+                            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+                            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                            "value_clip": self.cfg.algorithm.get("value_clip", None),
+                            "huber_delta": self.cfg.algorithm.get("huber_delta", None),
+                            "loss_mask": loss_mask,
+                            "loss_mask_sum": loss_mask_sum,
+                            "max_episode_steps": self.cfg.env.train.max_episode_steps,
+                            "task_type": self.cfg.runner.task_type,
+                            "critic_warmup": False,
+                        }
+                        loss, metrics_data = policy_loss(**loss_kwargs)
+                        metrics_data["actor/total_loss"] = loss.detach().item()
+                        append_to_dict(metrics2, metrics_data)
+
+                    torch.cuda.empty_cache()
+                    grad_norm, lr_list = self.optimizer_step()
+                    append_to_dict(metrics2, {"actor/grad_norm": grad_norm, "actor/lr": lr_list[0]})
+
+            self.lr_scheduler.step()
+            self.optimizer.zero_grad()
+            clear_memory()
+            mean_metric2 = {key: np.mean(value) for key, value in metrics2.items()}
+            mean_metric2 = all_reduce_dict(mean_metric2, op=torch.distributed.ReduceOp.AVG)
+            # Prefix second-pass metrics with "segrpo/" to distinguish in tensorboard
+            for k, v in mean_metric2.items():
+                mean_metric_dict[k.replace("actor/", "actor/segrpo_")] = v
 
         return mean_metric_dict
 

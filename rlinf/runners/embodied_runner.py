@@ -155,6 +155,14 @@ class EmbodiedRunner:
         return eval_metrics
 
     def run(self):
+        if self.cfg.runner.only_eval:
+            self.update_rollout_weights()
+            eval_metrics = self.evaluate()
+            eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
+            self.metric_logger.log(data=eval_metrics, step=0)
+            self.metric_logger.finish()
+            return
+
         start_step = self.global_step
         start_time = time.time()
         for _step in range(start_step, self.max_steps):
@@ -181,19 +189,22 @@ class EmbodiedRunner:
                     ).wait()
                     rollout_handle.wait()
 
-                # ReGRPO: wait for env to finish rewriting and get p_flip
+                # ReGRPO/SeGRPO/FullGRPO: wait for env to finish rewriting and get rewrite data
                 regrpo_data = None
-                if self.cfg.algorithm.get("adv_type", "") == "regrpo":
+                if self.cfg.algorithm.get("adv_type", "") in ("regrpo", "segrpo", "fullgrpo"):
                     env_results_list = [
                         results for results in env_handle.wait() if results is not None
                     ]
-                    # Extract regrpo data from env_metrics
+                    # Extract regrpo/segrpo data from env_metrics
                     for env_result in env_results_list:
                         if "regrpo_t_clip" in env_result and "regrpo_p_flip" in env_result:
                             regrpo_data = {
                                 "t_clip": env_result["regrpo_t_clip"],
                                 "p_flip": env_result["regrpo_p_flip"],
                             }
+                            # SeGRPO: also extract mean rewrite rewards
+                            if "segrpo_rewrite_rewards" in env_result:
+                                regrpo_data["rewrite_rewards"] = env_result["segrpo_rewrite_rewards"]
                             break
 
                 # compute advantages and returns.
@@ -249,8 +260,8 @@ class EmbodiedRunner:
                 }
             )
 
-            # Get env_results (already fetched for regrpo)
-            if self.cfg.algorithm.get("adv_type", "") != "regrpo":
+            # Get env_results (already fetched for regrpo/segrpo/fullgrpo)
+            if self.cfg.algorithm.get("adv_type", "") not in ("regrpo", "segrpo", "fullgrpo"):
                 env_results_list = [
                     results for results in env_handle.wait() if results is not None
                 ]

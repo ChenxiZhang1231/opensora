@@ -99,7 +99,7 @@ def list_of_dict_to_dict_of_list(
 
 
 def save_rollout_video(
-    rollout_images: list[np.ndarray], output_dir: str, video_name: str, fps: int = 30
+    rollout_images: list[np.ndarray], output_dir: str, video_name: str, fps: int = 10
 ) -> None:
     """
     Saves an MP4 replay of an episode.

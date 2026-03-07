@@ -208,6 +208,7 @@ class OpenSoraEnv(BaseWorldEnv):
                 {
                     "success_once": self.success_once.cpu(),
                     "returns": self.returns.cpu(),
+                    "has_succeeded": self.has_succeeded.cpu(),
                 }
             )
 
@@ -252,6 +253,8 @@ class OpenSoraEnv(BaseWorldEnv):
         if self.record_metrics and "success_once" in state:
             self.success_once = state["success_once"].to(self.device)
             self.returns = state["returns"].to(self.device)
+            if "has_succeeded" in state:
+                self.has_succeeded = state["has_succeeded"].to(self.device)
 
     def offload(self):
         """Move heavy models and runtime tensors to CPU."""
@@ -266,6 +269,7 @@ class OpenSoraEnv(BaseWorldEnv):
         if self.record_metrics:
             self.success_once = self.success_once.cpu()
             self.returns = self.returns.cpu()
+            self.has_succeeded = self.has_succeeded.cpu()
         for env_idx in range(self.num_envs):
             self.image_queue[env_idx] = deque(
                 [
@@ -290,6 +294,7 @@ class OpenSoraEnv(BaseWorldEnv):
         if self.record_metrics:
             self.success_once = self.success_once.to(self.device)
             self.returns = self.returns.to(self.device)
+            self.has_succeeded = self.has_succeeded.to(self.device)
         for env_idx in range(self.num_envs):
             self.image_queue[env_idx] = deque(
                 [
@@ -315,6 +320,9 @@ class OpenSoraEnv(BaseWorldEnv):
         self.returns = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.float32
         )
+        self.has_succeeded = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -324,12 +332,14 @@ class OpenSoraEnv(BaseWorldEnv):
             if self.record_metrics:
                 self.success_once[mask] = False
                 self.returns[mask] = 0
+                self.has_succeeded[mask] = False
             # self._elapsed_steps = 0
         else:
             self.prev_step_reward[:] = 0
             if self.record_metrics:
                 self.success_once[:] = False
                 self.returns[:] = 0.0
+                self.has_succeeded[:] = False
             self._elapsed_steps = 0
 
     def _record_metrics(self, step_reward, terminations, infos):
@@ -356,7 +366,21 @@ class OpenSoraEnv(BaseWorldEnv):
         return infos
 
     def _calc_step_reward(self, chunk_rewards):
-        """Calculate step reward"""
+        """Calculate step reward based on reward mode."""
+        # Success reward mode: give fixed reward on first success only
+        if getattr(self.cfg, "use_success_reward", False):
+            success_threshold = getattr(self.cfg, "success_reward_threshold", 0.9)
+            success_coef = getattr(self.cfg, "success_reward_coef", 1.0)
+
+            current_success = chunk_rewards.max(dim=1)[0] >= success_threshold
+            first_success = current_success & (~self.has_succeeded)
+            self.has_succeeded = self.has_succeeded | current_success
+
+            rewards = torch.zeros_like(chunk_rewards)
+            rewards[first_success, -1] = success_coef * self.cfg.reward_coef
+            return rewards
+
+        # Relative reward mode: return reward diff
         reward_diffs = torch.zeros(
             (self.num_envs, self.chunk), dtype=torch.float32, device=self.device
         )
@@ -822,6 +846,8 @@ class OpenSoraEnv(BaseWorldEnv):
 
         # Get rewards
         chunk_rewards = self._infer_next_chunk_rewards()
+        # if self.elapsed_steps >= 256:
+        # breakpoint()    
         chunk_rewards_tensors = self._calc_step_reward(chunk_rewards)
 
         # Estimate success (terminations) based on rewards

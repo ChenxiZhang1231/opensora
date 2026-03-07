@@ -48,6 +48,9 @@ class MultiStepRolloutWorker(Worker):
         self.device = torch.cuda.current_device()
 
         self.num_pipeline_stages = cfg.rollout.pipeline_stage_num
+
+        # ReGRPO/SeGRPO/FullGRPO: enable sending logprobs to env worker for t_clip calculation
+        self.enable_regrpo = cfg.algorithm.get("adv_type", "") in ("regrpo", "segrpo", "fullgrpo")
         self.enable_offload = self.cfg.rollout.get("enable_offload", False)
 
         self.placement = HybridComponentPlacement(cfg, Cluster())
@@ -78,8 +81,8 @@ class MultiStepRolloutWorker(Worker):
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
         self.enable_eval = cfg.runner.val_check_interval > 0 or cfg.runner.only_eval
 
-        # ReGRPO: flag to enable chunk state saving for rewriting
-        self.enable_regrpo = cfg.algorithm.get("adv_type", "") == "regrpo"
+        # ReGRPO/SeGRPO/FullGRPO: flag to enable chunk state saving for rewriting
+        self.enable_regrpo = cfg.algorithm.get("adv_type", "") in ("regrpo", "segrpo", "fullgrpo")
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -116,6 +119,12 @@ class MultiStepRolloutWorker(Worker):
                 self.total_num_train_envs // self.num_pipeline_stages
             ),
         }
+
+        # ReGRPO: reuse train ranks for rewriting
+        if self.enable_regrpo:
+            self.dst_ranks["rewrite"] = self.dst_ranks["train"]
+            self.src_ranks["rewrite"] = self.src_ranks["train"]
+
         if self.enable_eval:
             self.dst_ranks["eval"] = self._setup_dst_ranks(
                 self.total_num_eval_envs // self.num_pipeline_stages
@@ -356,6 +365,10 @@ class MultiStepRolloutWorker(Worker):
 
                 self.send_chunk_actions(output_channel, actions)
 
+                # ReGRPO: send logprobs to env worker for t_clip calculation
+                if self.enable_regrpo and result["prev_logprobs"] is not None:
+                    self.send_chunk_logprobs(output_channel, result["prev_logprobs"])
+
         for stage_id in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
 
@@ -421,8 +434,59 @@ class MultiStepRolloutWorker(Worker):
                 self.rollout_results[stage_id], actor_channel
             )
 
+        # ReGRPO: handle rewriting requests from env worker
+        if self.enable_regrpo:
+            await self.handle_regrpo_rewriting(input_channel, output_channel)
+
         if self.enable_offload:
             self.offload_model()
+
+    async def handle_regrpo_rewriting(
+        self, input_channel: Channel, output_channel: Channel
+    ):
+        """Handle ReGRPO rewriting requests from env worker.
+
+        This method receives observations from env worker, generates new actions
+        using the policy, and sends them back for rewriting trajectories.
+
+        The loop structure must match exactly with env_worker.rewrite_trajectories:
+        - for rewrite_idx in range(num_rewrite)
+        -   for epoch in range(rollout_epoch)
+        -     for stage_id in range(stage_num)
+        -       for chunk_idx in range(per_stage_epoch_min_t_clip[stage_id, epoch], n_chunk_steps)
+        """
+        num_rewrite = self.cfg.algorithm.get("regrpo", {}).get("num_rewrite", 2)
+        rollout_epoch = self.cfg.algorithm.rollout_epoch
+        n_chunk_steps = (
+            self.cfg.env.train.max_steps_per_rollout_epoch
+            // self.cfg.actor.model.num_action_chunks
+        )
+
+        # Receive per-(stage, epoch) min t_clips from each env worker and aggregate
+        # by taking the minimum (conservative: start from the earliest critical point).
+        per_stage_epoch_min_t_clips_list = []
+        for src_rank, _ in self.src_ranks["rewrite"]:
+            meta = await input_channel.get(
+                key=CommMapper.build_channel_key(
+                    src_rank, self._rank, extra="rewrite_meta"
+                ),
+                async_op=True,
+            ).async_wait()
+            per_stage_epoch_min_t_clips_list.append(meta)
+        per_stage_epoch_min_t_clip = torch.stack(per_stage_epoch_min_t_clips_list).min(dim=0).values
+        # per_stage_epoch_min_t_clip: [stage_num, rollout_epoch]
+
+        for rewrite_idx in range(num_rewrite):
+            for epoch in range(rollout_epoch):
+                for stage_id in range(self.num_pipeline_stages):
+                    min_t_clip = int(per_stage_epoch_min_t_clip[stage_id, epoch].item())
+                    rewrite_steps = n_chunk_steps - min_t_clip
+                    for chunk_idx in range(rewrite_steps):
+                        env_output = await self.recv_env_output(
+                            input_channel, mode="rewrite"
+                        )
+                        actions, _ = self.predict(env_output["obs"], mode="train")
+                        self.send_chunk_actions(output_channel, actions, mode="rewrite")
 
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
@@ -461,19 +525,23 @@ class MultiStepRolloutWorker(Worker):
             )
 
     async def recv_env_output(
-        self, input_channel: Channel, mode: Literal["train", "eval"] = "train"
+        self,
+        input_channel: Channel,
+        mode: Literal["train", "eval", "rewrite"] = "train",
+        timeout: float | None = None,
     ) -> dict[str, torch.Tensor]:
         """Receive env outputs from mapped env ranks and merge if needed.
 
         Args:
             input_channel: Channel carrying env->rollout outputs.
-            mode: Rollout mode, either ``"train"`` or ``"eval"``.
+            mode: Rollout mode, either ``"train"``, ``"eval"``, or ``"rewrite"``.
+            timeout: Optional timeout in seconds for async wait.
 
         Returns:
             A single env output dict. When multiple env ranks are mapped to this
             rollout worker, outputs are merged on batch dimension.
         """
-        assert mode in ["train", "eval"], f"{mode=} is not supported"
+        assert mode in ["train", "eval", "rewrite"], f"{mode=} is not supported"
         src_ranks_and_sizes = self.src_ranks[mode]
         env_outputs = []
         for src_rank, expected_size in src_ranks_and_sizes:
@@ -529,16 +597,16 @@ class MultiStepRolloutWorker(Worker):
         self,
         output_channel: Channel,
         chunk_actions: torch.Tensor | np.ndarray,
-        mode: Literal["train", "eval"] = "train",
+        mode: Literal["train", "eval", "rewrite"] = "train",
     ):
         """Send action shards to mapped env ranks.
 
         Args:
             output_channel: Channel carrying rollout->env action chunks.
             chunk_actions: Predicted action chunk batch (tensor or ndarray).
-            mode: Rollout mode, either ``"train"`` or ``"eval"``.
+            mode: Rollout mode, either ``"train"``, ``"eval"``, or ``"rewrite"``.
         """
-        assert mode in ["train", "eval"], f"{mode=} is not supported"
+        assert mode in ["train", "eval", "rewrite"], f"{mode=} is not supported"
         dst_ranks_and_sizes = self.dst_ranks[mode]
         split_sizes = [size for _, size in dst_ranks_and_sizes]
         chunk_actions_split = self._split_actions(chunk_actions, split_sizes)
@@ -550,6 +618,34 @@ class MultiStepRolloutWorker(Worker):
             output_channel.put(
                 chunk_action_i,
                 key=CommMapper.build_channel_key(self._rank, dst_rank, extra=mode),
+                async_op=True,
+            )
+
+    def send_chunk_logprobs(
+        self,
+        output_channel: Channel,
+        chunk_logprobs: torch.Tensor,
+        mode: Literal["train", "eval"] = "train",
+    ):
+        """Send logprob shards to mapped env ranks for ReGRPO t_clip calculation.
+
+        Args:
+            output_channel: Channel carrying rollout->env logprobs.
+            chunk_logprobs: Predicted logprobs batch. Shape: [batch_size, ...]
+            mode: Rollout mode, either ``"train"`` or ``"eval"``.
+        """
+        assert mode in ["train", "eval"], f"{mode=} is not supported"
+        dst_ranks_and_sizes = self.dst_ranks[mode]
+        split_sizes = [size for _, size in dst_ranks_and_sizes]
+        # breakpoint()
+        # Split logprobs along batch dimension
+        chunk_logprobs_split = torch.split(chunk_logprobs, split_sizes, dim=0)
+
+        for (dst_rank, _), logprob_i in zip(dst_ranks_and_sizes, chunk_logprobs_split):
+            logprob_i = logprob_i.detach().cpu()
+            output_channel.put(
+                logprob_i,
+                key=CommMapper.build_channel_key(self._rank, dst_rank, extra=f"{mode}_logprobs"),
                 async_op=True,
             )
 

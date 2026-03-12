@@ -114,6 +114,14 @@ def _worker(
                 p.send(env.get_sim_state())
             elif cmd == "set_init_state":
                 obs = env.set_init_state(data)
+                # Reset robosuite's done flag AND timestep counter so the restored
+                # mid-episode state can accept new actions.
+                # OffScreenRenderEnv wraps robosuite env in self.env (not gymnasium).
+                # timestep must also be reset: set_init_state restores MuJoCo physics
+                # (qpos/qvel) but not the Python-level counters, so accumulated
+                # timestep across rollouts/rewrites could trigger the horizon check.
+                env.env.done = False
+                env.env.timestep = 0
                 p.send(obs)
             elif cmd == "reconfigure":
                 env.close()

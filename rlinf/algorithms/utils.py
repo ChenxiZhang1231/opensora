@@ -404,6 +404,7 @@ def aggregate_chunk_logprobs(
 def find_min_logprob_chunk(
     chunk_logprobs: torch.Tensor,
     min_prefix_chunks: int = 1,
+    max_prefix_chunks: int | None = None,
 ) -> torch.Tensor:
     """
     Find the chunk position with lowest logprob for each trajectory.
@@ -412,8 +413,9 @@ def find_min_logprob_chunk(
 
     Args:
         chunk_logprobs: Logprobs per chunk_step. Shape: [n_chunks, bsz]
-        min_prefix_chunks: Minimum number of prefix chunks to ensure
-            at least some prefix contribution.
+        min_prefix_chunks: Minimum number of prefix chunks (t_clip lower bound).
+        max_prefix_chunks: Maximum number of prefix chunks (t_clip upper bound).
+            If None, no upper bound is applied.
 
     Returns:
         t_clip: Rewrite position for each trajectory. Shape: [bsz]
@@ -421,8 +423,9 @@ def find_min_logprob_chunk(
     # Find argmin along chunk dimension
     t_clip = chunk_logprobs.argmin(dim=0)  # [bsz]
 
-    # Ensure at least min_prefix_chunks prefix chunks
-    t_clip = t_clip.clamp(min=min_prefix_chunks)
+    # Clamp to [min_prefix_chunks, max_prefix_chunks]
+    clamp_max = max_prefix_chunks if max_prefix_chunks is not None else chunk_logprobs.shape[0] - 1
+    t_clip = t_clip.clamp(min=min_prefix_chunks, max=clamp_max)
 
     return t_clip
 

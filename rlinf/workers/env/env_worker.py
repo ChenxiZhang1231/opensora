@@ -69,6 +69,9 @@ class EnvWorker(Worker):
         self.regrpo_min_prefix_chunks = cfg.algorithm.get("regrpo", {}).get(
             "min_prefix_chunks", 1
         )
+        self.regrpo_max_prefix_chunks = cfg.algorithm.get("regrpo", {}).get(
+            "max_prefix_chunks", None
+        )
         # Storage for chunk states, actions, and returns (per stage, per epoch)
         # chunk_states_buffer[stage_id][epoch][chunk_idx] = bytes
         self.chunk_states_buffer: list[list[list[bytes]]] = []
@@ -586,6 +589,9 @@ class EnvWorker(Worker):
                     if self.enable_regrpo and hasattr(
                         self.env_list[stage_id], "get_state"
                     ):
+                        # BP1: 只在第一个 chunk 触发一次，检查 enable_regrpo=True, hasattr=True
+                        if len(self.chunk_states_buffer[stage_id][epoch]) == 0:
+                            pass
                         chunk_state = self.env_list[stage_id].get_state()
                         self.chunk_states_buffer[stage_id][epoch].append(chunk_state)
 
@@ -750,7 +756,7 @@ class EnvWorker(Worker):
 
         # Helper function to get the innermost unwrapped env
         def get_base_env(env):
-            while hasattr(env, 'env'):
+            while hasattr(env, 'env') and 'get_state' not in type(env).__dict__:
                 env = env.env
             return env
 
@@ -775,7 +781,6 @@ class EnvWorker(Worker):
                     # stage/epoch, so all envs are restored to the same snapshot that
                     # precedes their respective t_clip.
                     min_t_clip = int(per_stage_epoch_min_t_clip[stage_id, epoch].item())
-
                     # Restore state at min_t_clip position
                     if min_t_clip < len(chunk_states):
                         base_env.load_state(chunk_states[min_t_clip])
@@ -784,8 +789,7 @@ class EnvWorker(Worker):
                     rewrite_cumulative_rewards = torch.zeros(envs_per_stage)
 
                     # Get initial observation after restoring state
-                    extracted_obs = base_env._wrap_obs()
-
+                    extracted_obs = base_env.wrap_obs()
                     # Rollout from min_t_clip to end using policy re-inference
                     for chunk_idx in range(min_t_clip, n_chunk_steps):
                         # Send observation to rollout worker
@@ -824,7 +828,7 @@ class EnvWorker(Worker):
                                     rewards.sum(axis=-1).copy()
                                 )
                             # Update observation for next step
-                            extracted_obs = base_env._wrap_obs()
+                            extracted_obs = base_env.wrap_obs()
                         else:
                             # Fallback for non-chunk environments
                             obs, rewards, terminations, truncations, infos = env.step(
@@ -970,9 +974,12 @@ class EnvWorker(Worker):
                     # Ensure at least min_prefix_chunks prefix chunks
                     # Also clamp to valid range considering window size
                     max_valid_t_clip = (termination_idx - window_size).clamp(min=self.regrpo_min_prefix_chunks)
+                    clamp_max = n_chunk_steps - window_size
+                    if self.regrpo_max_prefix_chunks is not None:
+                        clamp_max = min(clamp_max, self.regrpo_max_prefix_chunks)
                     t_clip = t_clip.clamp(
                         min=self.regrpo_min_prefix_chunks,
-                        max=n_chunk_steps - window_size
+                        max=clamp_max
                     )
                     t_clip = torch.min(t_clip, max_valid_t_clip)
                 all_t_clips.append(t_clip)
@@ -1011,6 +1018,14 @@ class EnvWorker(Worker):
             output_channel=self._rewrite_output_channel,
         )
         # rewrite_returns shape: [total_trajs, num_rewrite]
+
+        # Flush rewrite frames into a separate "rewrite" sub-directory so they
+        # do not leak into the next rollout's video.
+        for i in range(self.stage_num):
+            if self.cfg.env.train.video_cfg.save_video and isinstance(
+                self.env_list[i], RecordVideo
+            ):
+                self.env_list[i].flush_video(video_sub_dir="rewrite")
 
         # 3. Get original returns
         original_returns = self.get_original_returns()

@@ -18,6 +18,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, Union
 
+import torch
+
 from omegaconf.dictconfig import DictConfig
 
 from rlinf.scheduler import Channel
@@ -195,17 +197,23 @@ class EmbodiedRunner:
                     env_results_list = [
                         results for results in env_handle.wait() if results is not None
                     ]
-                    # Extract regrpo/segrpo data from env_metrics
+                    # Extract regrpo/segrpo data from all env_workers and concatenate
+                    # in env_worker rank order so that actor_rank_i gets data for
+                    # its own trajectory sub-batch (actor_rank_i ↔ env_worker_i).
+                    all_t_clips, all_p_flips, all_rewrite_rewards = [], [], []
                     for env_result in env_results_list:
                         if "regrpo_t_clip" in env_result and "regrpo_p_flip" in env_result:
-                            regrpo_data = {
-                                "t_clip": env_result["regrpo_t_clip"],
-                                "p_flip": env_result["regrpo_p_flip"],
-                            }
-                            # SeGRPO: also extract mean rewrite rewards
+                            all_t_clips.append(env_result["regrpo_t_clip"])
+                            all_p_flips.append(env_result["regrpo_p_flip"])
                             if "segrpo_rewrite_rewards" in env_result:
-                                regrpo_data["rewrite_rewards"] = env_result["segrpo_rewrite_rewards"]
-                            break
+                                all_rewrite_rewards.append(env_result["segrpo_rewrite_rewards"])
+                    if all_t_clips:
+                        regrpo_data = {
+                            "t_clip": torch.cat(all_t_clips),
+                            "p_flip": torch.cat(all_p_flips),
+                        }
+                        if all_rewrite_rewards:
+                            regrpo_data["rewrite_rewards"] = torch.cat(all_rewrite_rewards)
 
                 # compute advantages and returns.
                 with self.timer("cal_adv_and_returns"):

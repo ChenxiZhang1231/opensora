@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import copy
+import io
 import os
+import pickle
 from typing import Optional, Union
 
 import gym
@@ -205,6 +207,10 @@ class LiberoEnv(gym.Env):
         return self._elapsed_steps
 
     @property
+    def device(self):
+        return "cpu"
+
+    @property
     def info_logging_keys(self):
         return []
 
@@ -261,7 +267,83 @@ class LiberoEnv(gym.Env):
             ),
         }
 
-    def _wrap_obs(self, obs_list):
+    def wrap_obs(self, obs_list=None):
+        """Public wrapper around ``_wrap_obs`` for access through gymnasium Wrappers.
+
+        Gymnasium Wrappers block forwarding of private attributes (those starting
+        with ``_``) via ``__getattr__``, so this public method is used by
+        ``env_worker`` when ``base_env`` may be a gymnasium Wrapper instance.
+        """
+        return self._wrap_obs(obs_list)
+
+    def get_state(self) -> bytes:
+        """Serialize current MuJoCo simulation states for FullGRPO chunk-level restore.
+
+        Returns:
+            Pickled bytes containing per-env sim states and cached observations.
+        """
+        state = {
+            "sim_states": self.env.get_sim_state(),  # list of flattened numpy arrays
+            "current_raw_obs": self.current_raw_obs,
+            "elapsed_steps": self._elapsed_steps.copy(),
+            "prev_step_reward": self.prev_step_reward.copy(),
+            # Save task configuration so load_state can reconfigure if the env
+            # has switched tasks between get_state() and load_state() calls
+            # (e.g., during multi-epoch rollouts where epoch N+1 resets to a new task).
+            "task_ids": list(self.task_ids),
+            "trial_ids": list(self.trial_ids),
+        }
+        buffer = io.BytesIO()
+        pickle.dump(state, buffer)
+        return buffer.getvalue()
+
+    def load_state(self, state_buffer: bytes) -> None:
+        """Restore MuJoCo simulation states from a serialized buffer.
+
+        Calls ``set_init_state`` on each subprocess env to restore the MuJoCo
+        simulator, then updates the cached observation so that ``_wrap_obs()``
+        returns the correct observation for the restored state.
+
+        Args:
+            state_buffer: Bytes produced by ``get_state()``.
+        """
+        buffer = io.BytesIO(state_buffer)
+        state = pickle.load(buffer)
+        env_idx = np.arange(self.num_envs)
+
+        # If the env has reconfigured to a different task since get_state() was called
+        # (e.g., epoch N+1 reset to a new task with different objects/DOF), we must
+        # reconfigure back to the saved task before restoring the MuJoCo state.
+        # Different tasks have different numbers of free objects → different qpos/qvel
+        # dimensions. Restoring across tasks causes a shape mismatch in
+        # set_state_from_flattened().
+        saved_task_ids = state.get("task_ids")
+        if saved_task_ids is not None:
+            reconfig_env_idx = [
+                i for i in env_idx if self.task_ids[i] != saved_task_ids[i]
+            ]
+            if reconfig_env_idx:
+                # Temporarily update task_ids so get_env_fn_params reads the saved task
+                for i in reconfig_env_idx:
+                    self.task_ids[i] = saved_task_ids[i]
+                env_fn_params = self.get_env_fn_params(reconfig_env_idx)
+                # Recreate subprocess envs with the correct task XML (correct DOF)
+                self.env.reconfigure_env_fns(env_fn_params, reconfig_env_idx)
+            # Sync all task/trial ids to saved values
+            self.task_ids = list(saved_task_ids)
+            saved_trial_ids = state.get("trial_ids")
+            if saved_trial_ids is not None:
+                self.trial_ids = list(saved_trial_ids)
+
+        # set_init_state restores MuJoCo state and returns freshly rendered obs
+        self.env.set_init_state(state["sim_states"], id=env_idx)
+        self.current_raw_obs = state["current_raw_obs"]
+        self._elapsed_steps = state["elapsed_steps"]
+        self.prev_step_reward = state["prev_step_reward"]
+
+    def _wrap_obs(self, obs_list=None):
+        if obs_list is None:
+            obs_list = self.current_raw_obs
         images_and_states_list = []
         for obs in obs_list:
             images_and_states = self._extract_image_and_state(obs)

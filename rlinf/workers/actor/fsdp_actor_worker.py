@@ -1161,6 +1161,29 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return rollout_batch
 
+    def _slice_regrpo_data(self, regrpo_data: dict) -> dict:
+        """Slice the global regrpo_data to this rank's trajectory sub-batch.
+
+        The runner concatenates regrpo_data from all env_workers in rank order.
+        Actor rank r should use the slice [r*N : (r+1)*N] where N = total //
+        world_size.  Falls back to the full tensor if total is not divisible by
+        world_size or already equals the per-rank size.
+        """
+        if regrpo_data is None:
+            return regrpo_data
+        total = regrpo_data["t_clip"].shape[0]
+        world_size = self._world_size
+        if total % world_size != 0:
+            # Not evenly divisible — use as-is (single-rank or pre-sliced).
+            return regrpo_data
+        n = total // world_size
+        if n == total:
+            # world_size == 1, nothing to slice.
+            return regrpo_data
+        start = self._rank * n
+        end = start + n
+        return {k: v[start:end] for k, v in regrpo_data.items()}
+
     def compute_advantages_and_returns(
         self, regrpo_data: dict = None
     ) -> dict[str, torch.Tensor]:
@@ -1170,6 +1193,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Args:
             regrpo_data: Optional dict with 't_clip' and 'p_flip' tensors for ReGRPO.
         """
+        # Slice the global regrpo_data to this rank's sub-batch.
+        # The runner concatenates data from all env_workers; each actor rank
+        # must use only its own corresponding slice.
+        regrpo_data = self._slice_regrpo_data(regrpo_data)
+
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
@@ -1202,7 +1230,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 chunk_logprobs = aggregate_chunk_logprobs(prev_logprobs)
                 regrpo_cfg = self.cfg.algorithm.get("regrpo", {})
                 min_prefix_chunks = regrpo_cfg.get("min_prefix_chunks", 1)
-                t_clip = find_min_logprob_chunk(chunk_logprobs, min_prefix_chunks)
+                max_prefix_chunks = regrpo_cfg.get("max_prefix_chunks", None)
+                t_clip = find_min_logprob_chunk(chunk_logprobs, min_prefix_chunks, max_prefix_chunks)
                 flip_rate_temperature = regrpo_cfg.get("flip_rate_temperature", 1.0)
                 p_flip = compute_estimated_flip_rate(
                     chunk_logprobs, t_clip, temperature=flip_rate_temperature
@@ -1677,6 +1706,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             "critic_warmup": False,
                         }
                         loss, metrics_data = policy_loss(**loss_kwargs)
+
+                        loss /= self.gradient_accumulation
+                        with backward_ctx:
+                            self.grad_scaler.scale(loss).backward()
+
                         metrics_data["actor/total_loss"] = loss.detach().item()
                         append_to_dict(metrics2, metrics_data)
 
